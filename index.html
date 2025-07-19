@@ -82,7 +82,6 @@
             margin: 0 auto;
         }
 
-        /* BPM Display */
         #bpm-display-container {
             width: 180px;
             height: 180px;
@@ -124,15 +123,13 @@
             color: var(--text-muted-color);
         }
         
-        /* Status Message */
         .status-message {
             text-align: center;
             color: var(--text-muted-color);
-            min-height: 40px; /* Reserve space to prevent layout shift */
+            min-height: 40px; 
             padding: 0 1rem;
         }
 
-        /* Camera */
         .camera-container {
             position: relative;
             width: 100%;
@@ -148,7 +145,7 @@
             aspect-ratio: 4 / 3;
             object-fit: cover;
             display: block;
-            transform: scaleX(-1); /* Mirror view */
+            transform: scaleX(-1);
         }
 
         #roi-overlay {
@@ -169,7 +166,6 @@
             background: rgba(255, 71, 87, 0.1);
         }
 
-        /* Graph */
         #graph-container {
             width: 100%;
             background-color: var(--surface-color);
@@ -184,13 +180,12 @@
             display: block;
         }
 
-        /* Controls */
         .controls {
             display: flex;
             gap: 1rem;
             justify-content: center;
             width: 100%;
-            flex-wrap: wrap; /* Allow buttons to wrap on very small screens */
+            flex-wrap: wrap;
         }
 
         button {
@@ -226,7 +221,6 @@
             cursor: not-allowed;
         }
 
-        /* Desktop and Tablet Styles */
         @media (min-width: 768px) {
             .main-view {
                 padding: 2rem;
@@ -311,7 +305,6 @@
                 this.bpmDisplayContainer = document.getElementById('bpm-display-container');
                 this.statusMessage = document.getElementById('status-message');
                 
-                // Contexts
                 this.samplingContext = this.samplingCanvas.getContext('2d');
                 this.graphContext = this.graphCanvas.getContext('2d');
                 
@@ -339,7 +332,7 @@
                 const container = this.graphCanvas.parentElement;
                 this.graphCanvas.width = container.clientWidth;
                 this.graphCanvas.height = container.clientHeight;
-                this.drawGraph(); // Redraw graph on resize
+                this.drawGraph();
             }
 
             async startMonitoring() {
@@ -382,9 +375,7 @@
 
             stopMonitoring() {
                 this.isMonitoring = false;
-                if (this.videoStream) {
-                    this.videoStream.getTracks().forEach(track => track.stop());
-                }
+                if (this.videoStream) this.videoStream.getTracks().forEach(track => track.stop());
                 this.videoStream = null;
                 this.videoElement.srcObject = null;
                 this.startBtn.disabled = false;
@@ -403,7 +394,6 @@
 
             processLoop() {
                 if (!this.isMonitoring) return;
-                
                 this.processFrame();
                 requestAnimationFrame(() => this.processLoop());
             }
@@ -427,20 +417,13 @@
                     bSum += data[i + 2];
                 }
                 
-                const rgbSignal = {
-                    r: rSum / pixelCount,
-                    g: gSum / pixelCount,
-                    b: bSum / pixelCount
-                };
-
+                const rgbSignal = { r: rSum / pixelCount, g: gSum / pixelCount, b: bSum / pixelCount };
                 this.sampleBuffer.push({ ...rgbSignal, timestamp: Date.now() });
-                if (this.sampleBuffer.length > this.MAX_SAMPLES) {
-                    this.sampleBuffer.shift();
-                }
+                if (this.sampleBuffer.length > this.MAX_SAMPLES) this.sampleBuffer.shift();
 
                 if (this.sampleBuffer.length >= this.MIN_SAMPLES) {
                     const { bpm, signalForGraph } = this.calculateHeartRate();
-                    this.lastGraphSignal = signalForGraph; // Store for redraws
+                    this.lastGraphSignal = signalForGraph;
                     if (bpm) {
                         this.updateBpmDisplay(Math.round(bpm));
                         this.updateStatus('Measurement in progress...');
@@ -449,23 +432,61 @@
                 this.drawGraph();
             }
 
+            // --- Main Signal Processing ---
             calculateHeartRate() {
                 if (this.sampleBuffer.length < this.MIN_SAMPLES) return { bpm: null, signalForGraph: [] };
+                
+                // 1. Get raw RGB signals
+                const rawSignals = {
+                    r: this.sampleBuffer.map(s => s.r),
+                    g: this.sampleBuffer.map(s => s.g),
+                    b: this.sampleBuffer.map(s => s.b)
+                };
 
-                const signal = this.sampleBuffer.map(s => s.g);
+                // 2. Detrend signals
+                const detrendedR = this._detrend(rawSignals.r);
+                const detrendedG = this._detrend(rawSignals.g);
+                const detrendedB = this._detrend(rawSignals.b);
+
+                // 3. Apply Independent Component Analysis (ICA) to separate sources
+                const icaSources = this._ica([detrendedR, detrendedG, detrendedB]);
+
+                // 4. Find the best source component (the one that looks most like a heartbeat)
+                let bestSource = null;
+                let maxPower = -1;
+
+                for (const source of icaSources) {
+                    const { power } = this._analyzeSignal(source);
+                    if (power > maxPower) {
+                        maxPower = power;
+                        bestSource = source;
+                    }
+                }
+
+                if (!bestSource) return { bpm: null, signalForGraph: [] };
+                
+                // 5. Calculate BPM from the best source
+                const { bpm } = this._analyzeSignal(bestSource);
+                if (bpm === null) return { bpm: null, signalForGraph: bestSource };
+
+                this.bpmHistory.push(bpm);
+                if (this.bpmHistory.length > 5) this.bpmHistory.shift();
+
+                const smoothedBpm = this.bpmHistory.reduce((a, b) => a + b) / this.bpmHistory.length;
+                return { bpm: smoothedBpm, signalForGraph: bestSource };
+            }
+
+            _analyzeSignal(signal) {
                 const firstTs = this.sampleBuffer[0].timestamp;
                 const lastTs = this.sampleBuffer[this.sampleBuffer.length - 1].timestamp;
                 const samplingRate = this.sampleBuffer.length / ((lastTs - firstTs) / 1000);
 
-                const mean = signal.reduce((a, b) => a + b) / signal.length;
-                const detrendedSignal = signal.map(v => v - mean);
-                const windowedSignal = this.hannWindow(detrendedSignal);
-
+                const windowedSignal = this._hannWindow(signal);
                 const fftSize = 1 << Math.ceil(Math.log2(windowedSignal.length));
                 const complexSignal = windowedSignal.map(v => ({ real: v, imag: 0 }));
                 while (complexSignal.length < fftSize) complexSignal.push({ real: 0, imag: 0 });
 
-                const spectrum = this.fft(complexSignal);
+                const spectrum = this._fft(complexSignal);
                 const powerSpectrum = spectrum.slice(0, spectrum.length / 2).map(c => c.real * c.real + c.imag * c.imag);
 
                 const minFreq = this.BPM_MIN / 60;
@@ -473,40 +494,135 @@
                 const minIndex = Math.round(minFreq * fftSize / samplingRate);
                 const maxIndex = Math.round(maxFreq * fftSize / samplingRate);
 
-                let maxPower = 0;
+                let peakPower = 0;
                 let peakIndex = -1;
                 for (let i = minIndex; i <= maxIndex; i++) {
-                    if (powerSpectrum[i] > maxPower) {
-                        maxPower = powerSpectrum[i];
+                    if (powerSpectrum[i] > peakPower) {
+                        peakPower = powerSpectrum[i];
                         peakIndex = i;
                     }
                 }
 
-                if (peakIndex === -1) return { bpm: null, signalForGraph: windowedSignal };
-
+                if (peakIndex === -1) return { bpm: null, power: 0 };
+                
                 const peakFrequency = peakIndex * samplingRate / fftSize;
                 const bpm = peakFrequency * 60;
-
-                this.bpmHistory.push(bpm);
-                if (this.bpmHistory.length > 5) this.bpmHistory.shift();
-
-                const smoothedBpm = this.bpmHistory.reduce((a, b) => a + b) / this.bpmHistory.length;
-                return { bpm: smoothedBpm, signalForGraph: windowedSignal };
+                return { bpm, power: peakPower };
             }
 
-            hannWindow(signal) {
+            // --- Signal Processing Helpers ---
+            _detrend(signal) {
+                const mean = signal.reduce((a, b) => a + b, 0) / signal.length;
+                return signal.map(val => val - mean);
+            }
+
+            _hannWindow(signal) {
                 return signal.map((v, i) => v * 0.5 * (1 - Math.cos(2 * Math.PI * i / (signal.length - 1))));
             }
 
-            fft(complexSignal) {
+            // --- ICA and Linear Algebra ---
+            _ica(signals, iterations = 10) {
+                const [X, rows, cols] = this._center(signals);
+                const Cov = this._covariance(X);
+                const { U, D } = this._eigen(Cov);
+                const Whitening = this._multiply(this._multiply(U, this._diag(D.map(d => 1 / Math.sqrt(d)))), this._transpose(U));
+                const Z = this._multiply(Whitening, X);
+                let W = this._identity(rows);
+
+                for (let i = 0; i < iterations; i++) {
+                    const WZ = this._multiply(W, Z);
+                    const g = this._tanh(WZ);
+                    const gp = this._dtanh(WZ);
+                    const W_new = this._subtract(this._multiply(g, this._transpose(WZ)) / cols, this._multiply(this._diag(gp.map(row => row.reduce((a,b)=>a+b,0)/cols)), W));
+                    W = this._orthonormalize(this._add(W, W_new));
+                }
+                const S = this._multiply(W, Z);
+                return S;
+            }
+
+            _center(mat) {
+                const rows = mat.length;
+                const cols = mat[0].length;
+                const centered = [];
+                for (let i = 0; i < rows; i++) {
+                    const mean = mat[i].reduce((a, b) => a + b, 0) / cols;
+                    centered.push(mat[i].map(val => val - mean));
+                }
+                return [centered, rows, cols];
+            }
+
+            _covariance(mat) {
+                const n = mat.length;
+                const m = mat[0].length;
+                const cov = Array(n).fill(0).map(() => Array(n).fill(0));
+                for (let i = 0; i < n; i++) {
+                    for (let j = i; j < n; j++) {
+                        let sum = 0;
+                        for (let k = 0; k < m; k++) sum += mat[i][k] * mat[j][k];
+                        cov[i][j] = cov[j][i] = sum / (m - 1);
+                    }
+                }
+                return cov;
+            }
+            
+            _eigen(mat, iter=10) { // Power iteration for simplicity
+                const n = mat.length;
+                let V = this._identity(n);
+                let D = mat.map(row => [...row]);
+                for(let i=0; i<iter; i++){
+                    const [Q, R] = this._qrDecomposition(D);
+                    V = this._multiply(V, Q);
+                    D = this._multiply(this._transpose(Q), this._multiply(D, Q));
+                }
+                return {U: V, D: D.map((_, i) => D[i][i])};
+            }
+
+            _qrDecomposition(mat) { // Gram-Schmidt
+                const n = mat.length;
+                const m = mat[0].length;
+                const Q = Array(n).fill(0).map(() => Array(m).fill(0));
+                const R = Array(m).fill(0).map(() => Array(m).fill(0));
+                const a = this._transpose(mat);
+
+                for (let j = 0; j < m; j++) {
+                    let v = a[j];
+                    for (let i = 0; i < j; i++) {
+                        R[i][j] = this._dot(Q.map(row => row[i]), v);
+                        v = this._subtract(v, this._scale(Q.map(row => row[i]), R[i][j]));
+                    }
+                    const norm = Math.sqrt(this._dot(v, v));
+                    R[j][j] = norm;
+                    const q_j = this._scale(v, 1/norm);
+                    for(let k=0; k<n; k++) Q[k][j] = q_j[k];
+                }
+                return [Q, R];
+            }
+
+            _orthonormalize(mat){
+                 const [Q, R] = this._qrDecomposition(mat);
+                 return Q;
+            }
+
+            _dot = (v1, v2) => v1.reduce((sum, val, i) => sum + val * v2[i], 0);
+            _scale = (v, s) => v.map(val => val * s);
+            _transpose = mat => mat[0].map((_, i) => mat.map(row => row[i]));
+            _multiply = (m1, m2) => m1.map(row => this._transpose(m2).map(col => this._dot(row, col)));
+            _add = (m1, m2) => m1.map((row, i) => row.map((val, j) => val + m2[i][j]));
+            _subtract = (m1, m2) => m1.map((row, i) => row.map((val, j) => val - m2[i][j]));
+            _identity = n => Array(n).fill(0).map((_, i) => Array(n).fill(0).map((_, j) => i === j ? 1 : 0));
+            _diag = v => Array(v.length).fill(0).map((_, i) => Array(v.length).fill(0).map((_, j) => i === j ? v[i] : 0));
+            _tanh = m => m.map(row => row.map(val => Math.tanh(val)));
+            _dtanh = m => m.map(row => row.map(val => 1 - Math.pow(Math.tanh(val), 2)));
+            
+            _fft(complexSignal) { // Cooley-Tukey Radix-2
                 const N = complexSignal.length;
                 if (N <= 1) return complexSignal;
                 
                 const even = Array.from({ length: N / 2 }, (_, i) => complexSignal[i * 2]);
                 const odd = Array.from({ length: N / 2 }, (_, i) => complexSignal[i * 2 + 1]);
 
-                const fftEven = this.fft(even);
-                const fftOdd = this.fft(odd);
+                const fftEven = this._fft(even);
+                const fftOdd = this._fft(odd);
 
                 const spectrum = new Array(N);
                 for (let k = 0; k < N / 2; k++) {
@@ -515,18 +631,13 @@
                         real: Math.cos(angle) * fftOdd[k].real - Math.sin(angle) * fftOdd[k].imag,
                         imag: Math.sin(angle) * fftOdd[k].real + Math.cos(angle) * fftOdd[k].imag
                     };
-                    spectrum[k] = {
-                        real: fftEven[k].real + t.real,
-                        imag: fftEven[k].imag + t.imag
-                    };
-                    spectrum[k + N / 2] = {
-                        real: fftEven[k].real - t.real,
-                        imag: fftEven[k].imag - t.imag
-                    };
+                    spectrum[k] = { real: fftEven[k].real + t.real, imag: fftEven[k].imag + t.imag };
+                    spectrum[k + N / 2] = { real: fftEven[k].real - t.real, imag: fftEven[k].imag - t.imag };
                 }
                 return spectrum;
             }
 
+            // --- UI Update Methods ---
             updateBpmDisplay(bpm) {
                 this.bpmDisplay.textContent = bpm;
                 if (bpm) {
@@ -544,7 +655,6 @@
                 const ctx = this.graphContext;
                 const canvas = this.graphCanvas;
                 ctx.clearRect(0, 0, canvas.width, canvas.height);
-
                 if (!signal || signal.length === 0) return;
 
                 const xScale = canvas.width / (signal.length - 1);
@@ -556,9 +666,12 @@
                 ctx.strokeStyle = 'var(--graph-color)';
                 ctx.lineWidth = 2;
                 
+                const yOffset = canvas.height * 0.1;
+                const yRange = canvas.height * 0.8;
+
                 for (let i = 0; i < signal.length; i++) {
                     const x = i * xScale;
-                    const y = canvas.height - ((signal[i] - min) / range * (canvas.height * 0.8) + (canvas.height * 0.1));
+                    const y = canvas.height - (((signal[i] - min) / range * yRange) + yOffset);
                     if (i === 0) ctx.moveTo(x, y);
                     else ctx.lineTo(x, y);
                 }
@@ -566,14 +679,10 @@
             }
 
             clearGraph() {
-                if (this.graphContext) {
-                    this.graphContext.clearRect(0, 0, this.graphCanvas.width, this.graphCanvas.height);
-                }
+                if (this.graphContext) this.graphContext.clearRect(0, 0, this.graphCanvas.width, this.graphCanvas.height);
             }
         }
-
         new HeartRateMonitor();
     </script>
 </body>
-
 </html>
