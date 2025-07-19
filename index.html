@@ -1,0 +1,579 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Heart Rate Monitor - rPPG</title>
+    <style>
+        :root {
+            --bg-color: #121212;
+            --surface-color: #1e1e1e;
+            --primary-color: #bb86fc;
+            --primary-variant-color: #3700b3;
+            --secondary-color: #03dac6;
+            --text-color: #ffffff;
+            --text-muted-color: #a0a0a0;
+            --graph-color: #ff4757;
+            --radius-md: 12px;
+            --radius-lg: 16px;
+            --transition-speed: 0.3s;
+        }
+
+        @keyframes pulse {
+            0% { transform: scale(1); box-shadow: 0 0 0 0 rgba(255, 71, 87, 0.4); }
+            70% { transform: scale(1.05); box-shadow: 0 0 10px 20px rgba(255, 71, 87, 0); }
+            100% { transform: scale(1); box-shadow: 0 0 0 0 rgba(255, 71, 87, 0); }
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        html, body {
+            height: 100%;
+        }
+
+        body {
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif;
+            -webkit-font-smoothing: antialiased;
+            -moz-osx-font-smoothing: grayscale;
+        }
+
+        #app {
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .main-view {
+            display: flex;
+            flex-direction: column;
+            min-height: 100vh;
+            padding: 1rem;
+        }
+
+        .main-view header {
+            text-align: center;
+            padding: 1rem 0;
+            flex-shrink: 0;
+        }
+
+        h1 {
+            font-size: clamp(1.5rem, 5vw, 2rem);
+            font-weight: 300;
+            letter-spacing: 1px;
+            color: var(--primary-color);
+        }
+
+        .main-view main {
+            flex-grow: 1;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 1.5rem;
+            width: 100%;
+            max-width: 480px;
+            margin: 0 auto;
+        }
+
+        /* BPM Display */
+        #bpm-display-container {
+            width: 180px;
+            height: 180px;
+            border: 4px solid var(--graph-color);
+            border-radius: 50%;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            background: radial-gradient(circle, rgba(255, 71, 87, 0.1) 0%, transparent 70%);
+            transition: transform var(--transition-speed) ease;
+        }
+
+        #bpm-display-container.pulsing {
+            animation: pulse 1s infinite ease-out;
+        }
+
+        #bpm-display {
+            text-align: center;
+        }
+
+        #bpm-display label {
+            display: block;
+            font-size: 1rem;
+            text-transform: uppercase;
+            color: var(--text-muted-color);
+            margin-bottom: 0.5rem;
+        }
+
+        #bpm-value {
+            display: block;
+            font-size: clamp(3rem, 10vw, 3.5rem);
+            font-weight: 200;
+            color: var(--graph-color);
+            line-height: 1;
+        }
+
+        #bpm-value:empty::before {
+            content: "–";
+            color: var(--text-muted-color);
+        }
+        
+        /* Status Message */
+        .status-message {
+            text-align: center;
+            color: var(--text-muted-color);
+            min-height: 40px; /* Reserve space to prevent layout shift */
+            padding: 0 1rem;
+        }
+
+        /* Camera */
+        .camera-container {
+            position: relative;
+            width: 100%;
+            border-radius: var(--radius-lg);
+            overflow: hidden;
+            background-color: #000;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.2);
+        }
+
+        #camera-feed {
+            width: 100%;
+            height: auto;
+            aspect-ratio: 4 / 3;
+            object-fit: cover;
+            display: block;
+            transform: scaleX(-1); /* Mirror view */
+        }
+
+        #roi-overlay {
+            position: absolute;
+            top: 0; left: 0; right: 0; bottom: 0;
+            pointer-events: none;
+        }
+
+        #roi-box {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            width: 120px;
+            height: 80px;
+            transform: translate(-50%, -50%);
+            border: 2px solid rgba(255, 255, 255, 0.5);
+            border-radius: var(--radius-md);
+            background: rgba(255, 71, 87, 0.1);
+        }
+
+        /* Graph */
+        #graph-container {
+            width: 100%;
+            background-color: var(--surface-color);
+            height: 100px;
+            border-radius: var(--radius-md);
+            overflow: hidden;
+        }
+
+        #graph-canvas {
+            width: 100%;
+            height: 100%;
+            display: block;
+        }
+
+        /* Controls */
+        .controls {
+            display: flex;
+            gap: 1rem;
+            justify-content: center;
+            width: 100%;
+            flex-wrap: wrap; /* Allow buttons to wrap on very small screens */
+        }
+
+        button {
+            padding: 12px 24px;
+            border: none;
+            border-radius: var(--radius-md);
+            font-size: 1rem;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all var(--transition-speed) ease;
+            flex-grow: 1;
+            max-width: 200px;
+        }
+
+        .primary-btn {
+            background-color: var(--primary-color);
+            color: #000;
+        }
+        .primary-btn:hover:not(:disabled) {
+            background-color: white;
+        }
+
+        .secondary-btn {
+            background-color: var(--surface-color);
+            color: var(--primary-color);
+        }
+        .secondary-btn:hover:not(:disabled) {
+            background-color: #2a2a2a;
+        }
+        
+        button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        /* Desktop and Tablet Styles */
+        @media (min-width: 768px) {
+            .main-view {
+                padding: 2rem;
+            }
+            .main-view main {
+                gap: 2rem;
+            }
+            #bpm-display-container {
+                width: 220px;
+                height: 220px;
+            }
+        }
+    </style>
+</head>
+
+<body>
+    <div id="app">
+        <div class="main-view">
+            <header>
+                <h1>💓 rPPG Heart Rate</h1>
+            </header>
+
+            <main>
+                <div id="bpm-display-container">
+                    <div id="bpm-display">
+                        <label>BPM</label>
+                        <span id="bpm-value"></span>
+                    </div>
+                </div>
+
+                <p id="status-message" class="status-message">Place your face in the camera view and press Start.</p>
+
+                <div class="camera-container">
+                    <video id="camera-feed" autoplay playsinline muted></video>
+                    <div id="roi-overlay">
+                        <div id="roi-box"></div>
+                    </div>
+                </div>
+
+                <div id="graph-container">
+                    <canvas id="graph-canvas"></canvas>
+                </div>
+
+                <div class="controls">
+                    <button id="start-btn" class="primary-btn">Start</button>
+                    <button id="stop-btn" class="secondary-btn" disabled>Stop</button>
+                </div>
+            </main>
+        </div>
+    </div>
+
+    <canvas id="sampling-canvas" style="display:none;"></canvas>
+
+    <script>
+        "use strict";
+
+        class HeartRateMonitor {
+            constructor() {
+                // Config
+                this.IMAGE_WIDTH = 120;
+                this.IMAGE_HEIGHT = 80;
+                this.MAX_SAMPLES = 300;
+                this.MIN_SAMPLES = 150;
+                this.START_DELAY = 1000;
+                this.BPM_MIN = 45;
+                this.BPM_MAX = 180;
+                
+                // State
+                this.sampleBuffer = [];
+                this.isMonitoring = false;
+                this.videoStream = null;
+                this.bpmHistory = [];
+                this.lastGraphSignal = [];
+
+                // DOM Elements
+                this.videoElement = document.getElementById('camera-feed');
+                this.samplingCanvas = document.getElementById('sampling-canvas');
+                this.graphCanvas = document.getElementById('graph-canvas');
+                this.bpmDisplay = document.getElementById('bpm-value');
+                this.startBtn = document.getElementById('start-btn');
+                this.stopBtn = document.getElementById('stop-btn');
+                this.bpmDisplayContainer = document.getElementById('bpm-display-container');
+                this.statusMessage = document.getElementById('status-message');
+                
+                // Contexts
+                this.samplingContext = this.samplingCanvas.getContext('2d');
+                this.graphContext = this.graphCanvas.getContext('2d');
+                
+                this.init();
+            }
+
+            init() {
+                this.startBtn.addEventListener('click', () => this.startMonitoring());
+                this.stopBtn.addEventListener('click', () => this.stopMonitoring());
+                window.addEventListener('resize', () => this.handleResize());
+                this.handleResize();
+                
+                if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                    this.updateStatus('Camera access not supported by your browser.', true);
+                    this.startBtn.disabled = true;
+                }
+            }
+            
+            updateStatus(message, isError = false) {
+                this.statusMessage.textContent = message;
+                this.statusMessage.style.color = isError ? 'var(--graph-color)' : 'var(--text-muted-color)';
+            }
+
+            handleResize() {
+                const container = this.graphCanvas.parentElement;
+                this.graphCanvas.width = container.clientWidth;
+                this.graphCanvas.height = container.clientHeight;
+                this.drawGraph(); // Redraw graph on resize
+            }
+
+            async startMonitoring() {
+                try {
+                    this.reset();
+                    this.updateStatus('Initializing camera...');
+                    this.startBtn.disabled = true;
+
+                    this.videoStream = await navigator.mediaDevices.getUserMedia({
+                        video: {
+                            facingMode: 'user',
+                            width: { ideal: 640 },
+                            height: { ideal: 480 },
+                            frameRate: { ideal: 30 }
+                        }
+                    });
+
+                    this.videoElement.srcObject = this.videoStream;
+                    await this.videoElement.play();
+
+                    this.samplingCanvas.width = this.IMAGE_WIDTH;
+                    this.samplingCanvas.height = this.IMAGE_HEIGHT;
+
+                    this.isMonitoring = true;
+                    this.stopBtn.disabled = false;
+
+                    setTimeout(() => {
+                        if (this.isMonitoring) {
+                            this.updateStatus('Acquiring signal, please hold still...');
+                            this.processLoop();
+                        }
+                    }, this.START_DELAY);
+
+                } catch (error) {
+                    console.error('Error starting monitoring:', error);
+                    this.updateStatus('Error accessing camera: ' + error.message, true);
+                    this.stopMonitoring();
+                }
+            }
+
+            stopMonitoring() {
+                this.isMonitoring = false;
+                if (this.videoStream) {
+                    this.videoStream.getTracks().forEach(track => track.stop());
+                }
+                this.videoStream = null;
+                this.videoElement.srcObject = null;
+                this.startBtn.disabled = false;
+                this.stopBtn.disabled = true;
+                this.updateBpmDisplay('');
+                this.updateStatus('Place your face in the camera view and press Start.');
+            }
+            
+            reset() {
+                this.sampleBuffer = [];
+                this.bpmHistory = [];
+                this.lastGraphSignal = [];
+                this.updateBpmDisplay('');
+                this.clearGraph();
+            }
+
+            processLoop() {
+                if (!this.isMonitoring) return;
+                
+                this.processFrame();
+                requestAnimationFrame(() => this.processLoop());
+            }
+
+            processFrame() {
+                this.samplingContext.drawImage(this.videoElement, 0, 0, this.IMAGE_WIDTH, this.IMAGE_HEIGHT);
+
+                const roiX = Math.floor(this.IMAGE_WIDTH * 0.25);
+                const roiY = Math.floor(this.IMAGE_HEIGHT * 0.3);
+                const roiWidth = Math.floor(this.IMAGE_WIDTH * 0.5);
+                const roiHeight = Math.floor(this.IMAGE_HEIGHT * 0.4);
+
+                const imageData = this.samplingContext.getImageData(roiX, roiY, roiWidth, roiHeight);
+                const data = imageData.data;
+                let rSum = 0, gSum = 0, bSum = 0;
+                const pixelCount = data.length / 4;
+
+                for (let i = 0; i < data.length; i += 4) {
+                    rSum += data[i];
+                    gSum += data[i + 1];
+                    bSum += data[i + 2];
+                }
+                
+                const rgbSignal = {
+                    r: rSum / pixelCount,
+                    g: gSum / pixelCount,
+                    b: bSum / pixelCount
+                };
+
+                this.sampleBuffer.push({ ...rgbSignal, timestamp: Date.now() });
+                if (this.sampleBuffer.length > this.MAX_SAMPLES) {
+                    this.sampleBuffer.shift();
+                }
+
+                if (this.sampleBuffer.length >= this.MIN_SAMPLES) {
+                    const { bpm, signalForGraph } = this.calculateHeartRate();
+                    this.lastGraphSignal = signalForGraph; // Store for redraws
+                    if (bpm) {
+                        this.updateBpmDisplay(Math.round(bpm));
+                        this.updateStatus('Measurement in progress...');
+                    }
+                }
+                this.drawGraph();
+            }
+
+            calculateHeartRate() {
+                if (this.sampleBuffer.length < this.MIN_SAMPLES) return { bpm: null, signalForGraph: [] };
+
+                const signal = this.sampleBuffer.map(s => s.g);
+                const firstTs = this.sampleBuffer[0].timestamp;
+                const lastTs = this.sampleBuffer[this.sampleBuffer.length - 1].timestamp;
+                const samplingRate = this.sampleBuffer.length / ((lastTs - firstTs) / 1000);
+
+                const mean = signal.reduce((a, b) => a + b) / signal.length;
+                const detrendedSignal = signal.map(v => v - mean);
+                const windowedSignal = this.hannWindow(detrendedSignal);
+
+                const fftSize = 1 << Math.ceil(Math.log2(windowedSignal.length));
+                const complexSignal = windowedSignal.map(v => ({ real: v, imag: 0 }));
+                while (complexSignal.length < fftSize) complexSignal.push({ real: 0, imag: 0 });
+
+                const spectrum = this.fft(complexSignal);
+                const powerSpectrum = spectrum.slice(0, spectrum.length / 2).map(c => c.real * c.real + c.imag * c.imag);
+
+                const minFreq = this.BPM_MIN / 60;
+                const maxFreq = this.BPM_MAX / 60;
+                const minIndex = Math.round(minFreq * fftSize / samplingRate);
+                const maxIndex = Math.round(maxFreq * fftSize / samplingRate);
+
+                let maxPower = 0;
+                let peakIndex = -1;
+                for (let i = minIndex; i <= maxIndex; i++) {
+                    if (powerSpectrum[i] > maxPower) {
+                        maxPower = powerSpectrum[i];
+                        peakIndex = i;
+                    }
+                }
+
+                if (peakIndex === -1) return { bpm: null, signalForGraph: windowedSignal };
+
+                const peakFrequency = peakIndex * samplingRate / fftSize;
+                const bpm = peakFrequency * 60;
+
+                this.bpmHistory.push(bpm);
+                if (this.bpmHistory.length > 5) this.bpmHistory.shift();
+
+                const smoothedBpm = this.bpmHistory.reduce((a, b) => a + b) / this.bpmHistory.length;
+                return { bpm: smoothedBpm, signalForGraph: windowedSignal };
+            }
+
+            hannWindow(signal) {
+                return signal.map((v, i) => v * 0.5 * (1 - Math.cos(2 * Math.PI * i / (signal.length - 1))));
+            }
+
+            fft(complexSignal) {
+                const N = complexSignal.length;
+                if (N <= 1) return complexSignal;
+                
+                const even = Array.from({ length: N / 2 }, (_, i) => complexSignal[i * 2]);
+                const odd = Array.from({ length: N / 2 }, (_, i) => complexSignal[i * 2 + 1]);
+
+                const fftEven = this.fft(even);
+                const fftOdd = this.fft(odd);
+
+                const spectrum = new Array(N);
+                for (let k = 0; k < N / 2; k++) {
+                    const angle = -2 * Math.PI * k / N;
+                    const t = {
+                        real: Math.cos(angle) * fftOdd[k].real - Math.sin(angle) * fftOdd[k].imag,
+                        imag: Math.sin(angle) * fftOdd[k].real + Math.cos(angle) * fftOdd[k].imag
+                    };
+                    spectrum[k] = {
+                        real: fftEven[k].real + t.real,
+                        imag: fftEven[k].imag + t.imag
+                    };
+                    spectrum[k + N / 2] = {
+                        real: fftEven[k].real - t.real,
+                        imag: fftEven[k].imag - t.imag
+                    };
+                }
+                return spectrum;
+            }
+
+            updateBpmDisplay(bpm) {
+                this.bpmDisplay.textContent = bpm;
+                if (bpm) {
+                    const beatDuration = 60 / bpm;
+                    this.bpmDisplayContainer.style.animationDuration = `${beatDuration}s`;
+                    this.bpmDisplayContainer.classList.add('pulsing');
+                } else {
+                    this.bpmDisplayContainer.classList.remove('pulsing');
+                    this.bpmDisplayContainer.style.animationDuration = '';
+                }
+            }
+
+            drawGraph() {
+                const signal = this.lastGraphSignal;
+                const ctx = this.graphContext;
+                const canvas = this.graphCanvas;
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+                if (!signal || signal.length === 0) return;
+
+                const xScale = canvas.width / (signal.length - 1);
+                const min = Math.min(...signal);
+                const max = Math.max(...signal);
+                const range = max - min || 1;
+
+                ctx.beginPath();
+                ctx.strokeStyle = 'var(--graph-color)';
+                ctx.lineWidth = 2;
+                
+                for (let i = 0; i < signal.length; i++) {
+                    const x = i * xScale;
+                    const y = canvas.height - ((signal[i] - min) / range * (canvas.height * 0.8) + (canvas.height * 0.1));
+                    if (i === 0) ctx.moveTo(x, y);
+                    else ctx.lineTo(x, y);
+                }
+                ctx.stroke();
+            }
+
+            clearGraph() {
+                if (this.graphContext) {
+                    this.graphContext.clearRect(0, 0, this.graphCanvas.width, this.graphCanvas.height);
+                }
+            }
+        }
+
+        new HeartRateMonitor();
+    </script>
+</body>
+
+</html>
