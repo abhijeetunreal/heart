@@ -282,20 +282,18 @@
                 // Config
                 this.IMAGE_WIDTH = 120;
                 this.IMAGE_HEIGHT = 80;
-                this.MAX_SAMPLES = 300;
-                this.MIN_SAMPLES = 150;
+                this.MAX_SAMPLES = 256; // Use power of 2 for easier FFT
+                this.MIN_SAMPLES = 128; 
                 this.START_DELAY = 1000;
                 this.BPM_MIN = 45;
                 this.BPM_MAX = 180;
                 
-                // State
                 this.sampleBuffer = [];
                 this.isMonitoring = false;
                 this.videoStream = null;
                 this.bpmHistory = [];
                 this.lastGraphSignal = [];
 
-                // DOM Elements
                 this.videoElement = document.getElementById('camera-feed');
                 this.samplingCanvas = document.getElementById('sampling-canvas');
                 this.graphCanvas = document.getElementById('graph-canvas');
@@ -432,57 +430,74 @@
                 this.drawGraph();
             }
 
-            // --- Main Signal Processing ---
+            // --- Main Signal Processing using POS ---
             calculateHeartRate() {
                 if (this.sampleBuffer.length < this.MIN_SAMPLES) return { bpm: null, signalForGraph: [] };
-                
-                // 1. Get raw RGB signals
-                const rawSignals = {
-                    r: this.sampleBuffer.map(s => s.r),
-                    g: this.sampleBuffer.map(s => s.g),
-                    b: this.sampleBuffer.map(s => s.b)
-                };
 
-                // 2. Detrend signals
-                const detrendedR = this._detrend(rawSignals.r);
-                const detrendedG = this._detrend(rawSignals.g);
-                const detrendedB = this._detrend(rawSignals.b);
+                // 1. Get raw RGB signals from buffer
+                const rawR = this.sampleBuffer.map(s => s.r);
+                const rawG = this.sampleBuffer.map(s => s.g);
+                const rawB = this.sampleBuffer.map(s => s.b);
 
-                // 3. Apply Independent Component Analysis (ICA) to separate sources
-                const icaSources = this._ica([detrendedR, detrendedG, detrendedB]);
+                // 2. Temporally normalize the signals
+                const normR = this._temporalNormalize(rawR);
+                const normG = this._temporalNormalize(rawG);
+                const normB = this._temporalNormalize(rawB);
 
-                // 4. Find the best source component (the one that looks most like a heartbeat)
-                let bestSource = null;
-                let maxPower = -1;
+                // 3. Apply the POS algorithm to get a clean pulse signal
+                const pulseSignal = this._pos(normR, normG, normB);
 
-                for (const source of icaSources) {
-                    const { power } = this._analyzeSignal(source);
-                    if (power > maxPower) {
-                        maxPower = power;
-                        bestSource = source;
-                    }
-                }
+                // 4. Analyze the clean signal to find BPM
+                const { bpm } = this._analyzeSignalForBPM(pulseSignal);
 
-                if (!bestSource) return { bpm: null, signalForGraph: [] };
-                
-                // 5. Calculate BPM from the best source
-                const { bpm } = this._analyzeSignal(bestSource);
-                if (bpm === null) return { bpm: null, signalForGraph: bestSource };
+                if (bpm === null) return { bpm: null, signalForGraph: pulseSignal };
 
+                // 5. Smooth the result
                 this.bpmHistory.push(bpm);
-                if (this.bpmHistory.length > 5) this.bpmHistory.shift();
-
+                if (this.bpmHistory.length > 10) this.bpmHistory.shift();
                 const smoothedBpm = this.bpmHistory.reduce((a, b) => a + b) / this.bpmHistory.length;
-                return { bpm: smoothedBpm, signalForGraph: bestSource };
+
+                return { bpm: smoothedBpm, signalForGraph: pulseSignal };
             }
 
-            _analyzeSignal(signal) {
+            // --- Signal Processing Helpers ---
+
+            _temporalNormalize(signal) {
+                const mean = signal.reduce((a, b) => a + b, 0) / signal.length;
+                if(mean === 0) return signal.map(()=>0);
+                return signal.map(val => val / mean - 1);
+            }
+            
+            _pos(normR, normG, normB) {
+                const N = normR.length;
+                let S1 = new Array(N);
+                let S2 = new Array(N);
+
+                // Project onto the plane orthogonal to the skin tone vector
+                for (let i = 0; i < N; i++) {
+                    S1[i] = normG[i] - normB[i];
+                    S2[i] = -2 * normR[i] + normG[i] + normB[i];
+                }
+                
+                // Tune the alpha parameter
+                const std1 = this._stdDev(S1);
+                const std2 = this._stdDev(S2);
+                if(std2 === 0) return S1; // Avoid division by zero
+                const alpha = std1 / std2;
+
+                // Combine the signals to get the final pulse signal
+                const S = S1.map((val, i) => val + alpha * S2[i]);
+                return S;
+            }
+            
+            _analyzeSignalForBPM(signal) {
                 const firstTs = this.sampleBuffer[0].timestamp;
                 const lastTs = this.sampleBuffer[this.sampleBuffer.length - 1].timestamp;
                 const samplingRate = this.sampleBuffer.length / ((lastTs - firstTs) / 1000);
+                if (isNaN(samplingRate)) return { bpm: null };
 
+                const fftSize = 1 << Math.ceil(Math.log2(signal.length));
                 const windowedSignal = this._hannWindow(signal);
-                const fftSize = 1 << Math.ceil(Math.log2(windowedSignal.length));
                 const complexSignal = windowedSignal.map(v => ({ real: v, imag: 0 }));
                 while (complexSignal.length < fftSize) complexSignal.push({ real: 0, imag: 0 });
 
@@ -503,116 +518,22 @@
                     }
                 }
 
-                if (peakIndex === -1) return { bpm: null, power: 0 };
+                if (peakIndex === -1) return { bpm: null };
                 
                 const peakFrequency = peakIndex * samplingRate / fftSize;
                 const bpm = peakFrequency * 60;
-                return { bpm, power: peakPower };
-            }
-
-            // --- Signal Processing Helpers ---
-            _detrend(signal) {
-                const mean = signal.reduce((a, b) => a + b, 0) / signal.length;
-                return signal.map(val => val - mean);
+                return { bpm };
             }
 
             _hannWindow(signal) {
                 return signal.map((v, i) => v * 0.5 * (1 - Math.cos(2 * Math.PI * i / (signal.length - 1))));
             }
 
-            // --- ICA and Linear Algebra ---
-            _ica(signals, iterations = 10) {
-                const [X, rows, cols] = this._center(signals);
-                const Cov = this._covariance(X);
-                const { U, D } = this._eigen(Cov);
-                const Whitening = this._multiply(this._multiply(U, this._diag(D.map(d => 1 / Math.sqrt(d)))), this._transpose(U));
-                const Z = this._multiply(Whitening, X);
-                let W = this._identity(rows);
-
-                for (let i = 0; i < iterations; i++) {
-                    const WZ = this._multiply(W, Z);
-                    const g = this._tanh(WZ);
-                    const gp = this._dtanh(WZ);
-                    const W_new = this._subtract(this._multiply(g, this._transpose(WZ)) / cols, this._multiply(this._diag(gp.map(row => row.reduce((a,b)=>a+b,0)/cols)), W));
-                    W = this._orthonormalize(this._add(W, W_new));
-                }
-                const S = this._multiply(W, Z);
-                return S;
+            _stdDev(signal) {
+                const mean = signal.reduce((a, b) => a + b, 0) / signal.length;
+                const variance = signal.reduce((acc, val) => acc + (val - mean) ** 2, 0) / signal.length;
+                return Math.sqrt(variance);
             }
-
-            _center(mat) {
-                const rows = mat.length;
-                const cols = mat[0].length;
-                const centered = [];
-                for (let i = 0; i < rows; i++) {
-                    const mean = mat[i].reduce((a, b) => a + b, 0) / cols;
-                    centered.push(mat[i].map(val => val - mean));
-                }
-                return [centered, rows, cols];
-            }
-
-            _covariance(mat) {
-                const n = mat.length;
-                const m = mat[0].length;
-                const cov = Array(n).fill(0).map(() => Array(n).fill(0));
-                for (let i = 0; i < n; i++) {
-                    for (let j = i; j < n; j++) {
-                        let sum = 0;
-                        for (let k = 0; k < m; k++) sum += mat[i][k] * mat[j][k];
-                        cov[i][j] = cov[j][i] = sum / (m - 1);
-                    }
-                }
-                return cov;
-            }
-            
-            _eigen(mat, iter=10) { // Power iteration for simplicity
-                const n = mat.length;
-                let V = this._identity(n);
-                let D = mat.map(row => [...row]);
-                for(let i=0; i<iter; i++){
-                    const [Q, R] = this._qrDecomposition(D);
-                    V = this._multiply(V, Q);
-                    D = this._multiply(this._transpose(Q), this._multiply(D, Q));
-                }
-                return {U: V, D: D.map((_, i) => D[i][i])};
-            }
-
-            _qrDecomposition(mat) { // Gram-Schmidt
-                const n = mat.length;
-                const m = mat[0].length;
-                const Q = Array(n).fill(0).map(() => Array(m).fill(0));
-                const R = Array(m).fill(0).map(() => Array(m).fill(0));
-                const a = this._transpose(mat);
-
-                for (let j = 0; j < m; j++) {
-                    let v = a[j];
-                    for (let i = 0; i < j; i++) {
-                        R[i][j] = this._dot(Q.map(row => row[i]), v);
-                        v = this._subtract(v, this._scale(Q.map(row => row[i]), R[i][j]));
-                    }
-                    const norm = Math.sqrt(this._dot(v, v));
-                    R[j][j] = norm;
-                    const q_j = this._scale(v, 1/norm);
-                    for(let k=0; k<n; k++) Q[k][j] = q_j[k];
-                }
-                return [Q, R];
-            }
-
-            _orthonormalize(mat){
-                 const [Q, R] = this._qrDecomposition(mat);
-                 return Q;
-            }
-
-            _dot = (v1, v2) => v1.reduce((sum, val, i) => sum + val * v2[i], 0);
-            _scale = (v, s) => v.map(val => val * s);
-            _transpose = mat => mat[0].map((_, i) => mat.map(row => row[i]));
-            _multiply = (m1, m2) => m1.map(row => this._transpose(m2).map(col => this._dot(row, col)));
-            _add = (m1, m2) => m1.map((row, i) => row.map((val, j) => val + m2[i][j]));
-            _subtract = (m1, m2) => m1.map((row, i) => row.map((val, j) => val - m2[i][j]));
-            _identity = n => Array(n).fill(0).map((_, i) => Array(n).fill(0).map((_, j) => i === j ? 1 : 0));
-            _diag = v => Array(v.length).fill(0).map((_, i) => Array(v.length).fill(0).map((_, j) => i === j ? v[i] : 0));
-            _tanh = m => m.map(row => row.map(val => Math.tanh(val)));
-            _dtanh = m => m.map(row => row.map(val => 1 - Math.pow(Math.tanh(val), 2)));
             
             _fft(complexSignal) { // Cooley-Tukey Radix-2
                 const N = complexSignal.length;
